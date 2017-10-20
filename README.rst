@@ -11,15 +11,13 @@ right.
 Installation
 ============
 
-
-..code:: bash
+.. code:: bash
 
   cp ./xmms2-mpris2 ~/.config/xmms2/startup.d/
   chmod +x ~/.config/xmms2/startup.d/xmms2-mpris2
   # then restart
   xmms2 server shutdown
   xmms2 list
-
 
 You probably also want to install libxmmsclient (the c lib, not the python)
 because it's using that. (worked out of the box with python3)
