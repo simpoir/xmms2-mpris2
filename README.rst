@@ -11,6 +11,9 @@ right.
 Installation
 ============
 
+
+..code:: bash
+
   cp ./xmms2-mpris2 ~/.config/xmms2/startup.d/
   chmod +x ~/.config/xmms2/startup.d/xmms2-mpris2
   # then restart
