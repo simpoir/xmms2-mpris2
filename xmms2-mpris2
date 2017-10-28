@@ -11,6 +11,7 @@ import dbus.service
 import enum
 import logging
 import os
+import re
 
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
@@ -202,12 +203,6 @@ class MediaPlayer(dbus.service.Object):
 
         self.cli = Client()
         self.cli.connect()
-        self.cli.broadcast_playback_status().notifier_set(self.on_status)
-        self.cli.broadcast_playback_current_id().notifier_set(
-            self.on_track_change)
-        self.cli.broadcast_playback_volume_changed().notifier_set(
-            self.on_volume_change)
-        self.cli.broadcast_quit().notifier_set(self.on_quit)
 
         self._props = {
             MPRIS_IFACE: dict(
@@ -218,12 +213,8 @@ class MediaPlayer(dbus.service.Object):
                 Fullscreen=False,
                 HasTrackList=False,
                 Identity="xmms2",
-                SupportedUriSchemes=["http", "https"],
-                SupportedMimeTypes=[
-                    # TODO list from server
-                    "audio/mpeg",
-                    "application/ogg",
-                ], ),
+                SupportedUriSchemes=self.supported_uri_schemes,
+                SupportedMimeTypes=self.supported_mime, ),
             MPRIS_PLAYER_IFACE: dict(
                 PlaybackStatus=self.playback_status,
                 LoopStatus="None",
@@ -231,7 +222,7 @@ class MediaPlayer(dbus.service.Object):
                 Shuffle=False,
                 Metadata=self.metadata(),
                 Volume=self.volume,
-                Position=0,
+                Position=self.position,
                 MinimumRate=1.0,
                 MaximumRate=1.0,
                 CanGoNext=self.can_go_next,
@@ -241,6 +232,35 @@ class MediaPlayer(dbus.service.Object):
                 CanSeek=True,
                 CanControl=True, ),
         }
+
+        self.cli.broadcast_playback_status().notifier_set(self.on_status)
+        self.cli.signal_playback_playtime().notifier_set(self.on_playtime)
+        self.cli.broadcast_playback_current_id().notifier_set(
+            self.on_track_change)
+        self.cli.broadcast_playback_volume_changed().notifier_set(
+            self.on_volume_change)
+        self.cli.broadcast_quit().notifier_set(self.on_quit)
+
+    @property
+    def supported_uri_schemes(self):
+        conf = self.cli.config_list_values().wait().get_value()
+        return sorted({
+            k.split(':')[1]
+            for k in conf if '.priority.application/x-url:' in k
+        })
+
+    @property
+    def supported_mime(self):
+        conf = self.cli.config_list_values().wait().get_value()
+        mimes = set()
+        for k in conf:
+            match = re.match(r"^\w+\.priority\.(\w+/[a-z]+)$", k)
+            if match:
+                mimes.add(match.groups()[0])
+        return sorted(mimes)
+
+    def on_playtime(self, v):
+        self.Set(MPRIS_PLAYER_IFACE, "Position", v * 1000)
 
     def on_status(self, v):
         name = Status(v).name
@@ -274,22 +294,26 @@ class MediaPlayer(dbus.service.Object):
         return Status(value).name
 
     @property
-    def current_pos(self):
+    def current_list_pos(self):
         playlist = self.cli.playlist_current_active().wait().get_value()
         playlist = playlist.encode('utf-8')
         res = self.cli.playlist_current_pos(playlist).wait().get_value()
         return res['position']
 
     @property
+    def position(self):
+        return self.cli.playback_playtime().wait().get_value() * 1000
+
+    @property
     def can_go_previous(self):
-        return self.current_pos > 0
+        return self.current_list_pos > 0
 
     @property
     def can_go_next(self):
         playlist = self.cli.playlist_current_active().wait().get_value()
         playlist = playlist.encode('utf-8')
         entries = self.cli.playlist_list_entries(playlist).wait().get_value()
-        return self.current_pos < len(entries) - 1
+        return self.current_list_pos < len(entries) - 1
 
     @property
     def volume(self):
@@ -333,67 +357,58 @@ class MediaPlayer(dbus.service.Object):
             ret['xesam:album'] = ' - '.join(info.get('channel', {}).values())
         return ret
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_IFACE, in_signature='', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_IFACE)
     def Quit(self):
         self.cli.quit().wait()
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_IFACE, in_signature='', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_IFACE)
     def Raise(self):
         pass
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE)
     def Next(self):
         self.cli.playlist_set_next_rel(1).wait()
         self.cli.playback_tickle(1).wait()
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE)
     def Previous(self):
         self.cli.playlist_set_next_rel(-1).wait()
         self.cli.playback_tickle(1).wait()
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE)
     def Pause(self):
         self.cli.playback_pause().wait()
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE)
     def PlayPause(self):
         if self._props[MPRIS_PLAYER_IFACE]['PlaybackStatus'] == 'Playing':
             self.Pause()
         else:
             self.Play()
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE)
     def Stop(self):
         self.cli.playback_stop().wait()
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE)
     def Play(self):
         self.cli.playback_start().wait()
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='x', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE, in_signature='x')
     def Seek(self, offset):
         LOG.info("seek to %d", offset)
-        # emit Seeked signal
-        pass
+        offset_ms = int(offset / 1000)
+        self.cli.playback_seek_ms_rel(offset_ms).wait()
+        self.Seeked(self.position)
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='ox', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE, in_signature='ox')
     def SetPosition(self, track_id, position):
         LOG.info("set pos to %d", position)
-        # emit Seeked signal
-        pass
+        position_ms = int(position / 1000)
+        self.cli.playback_seek_ms(position_ms).wait()
+        self.Seeked(self.position)
 
-    @dbus.service.method(
-        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='s', out_signature='')
+    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE, in_signature='s')
     def OpenUri(self, uri):
         LOG.info("open uri to %s", uri)
         pass
@@ -421,7 +436,6 @@ class MediaPlayer(dbus.service.Object):
     @dbus.service.method(
         dbus_interface=dbus.PROPERTIES_IFACE, in_signature='ssv')
     def Set(self, interface_name, property_name, new_value):
-        LOG.debug("Set %s to %r", property_name, new_value)
         if property_name == "Volume":
             self.volume = new_value
         self._props[interface_name][property_name] = new_value
@@ -433,6 +447,10 @@ class MediaPlayer(dbus.service.Object):
                           invalidated_properties):
         pass
 
+    @dbus.service.signal(dbus_interface=MPRIS_PLAYER_IFACE, signature='x')
+    def Seeked(self, position):
+        pass
+
 
 if __name__ == '__main__':
     logging.basicConfig(
@@ -442,11 +460,10 @@ if __name__ == '__main__':
     )
     DBusGMainLoop(set_as_default=True)
     m = MediaPlayer()
+    loop = GLib.MainLoop()
+    GLib.timeout_add(200, m.cli.io_handle)
+    LOG.info("Starting glib mainloop")
     try:
-        # thread = threading.Thread(target=m.cli.io_handle).start()
-        loop = GLib.MainLoop()
-        GLib.timeout_add(200, m.cli.io_handle)
-        LOG.info("Starting glib mainloop")
         loop.run()
     except KeyboardInterrupt:
         LOG.exception("KeyboardInterrupt. quitting.")
