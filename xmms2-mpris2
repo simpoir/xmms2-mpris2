@@ -9,23 +9,22 @@ import ctypes
 import dbus
 import dbus.service
 import enum
+import logging
 import os
 
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
+LOG_LEVEL = logging.DEBUG
 
+LOG = logging.getLogger('xmms2-mpris')
 MPRIS_IFACE = 'org.mpris.MediaPlayer2'
 MPRIS_PLAYER_IFACE = 'org.mpris.MediaPlayer2.Player'
 MPRIS_TRACKLIST_IFACE = 'org.mpris.MediaPlayer2.TrackList'
 MPRIS_PLAYLIST_IFACE = 'org.mpris.MediaPlayer2.PlayList'
+xmmsc = ctypes.CDLL("libxmmsclient.so.6")
 
-_props = {}
-
-
-@ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-def on_disconnect(_):
-    raise SystemExit
+_cb = []
 
 
 class Status(enum.Enum):
@@ -34,386 +33,424 @@ class Status(enum.Enum):
     Paused = 2
 
 
-class Types(enum.Enum):
-    NONE = 0
-    ERROR = 1
-    INT = 2
-    STRING = 3
-    COLL = 4
-    BIN = 5
-    LIST = 6
-    DICT = 7
-    BITBUF = 8
-    FLOAT = 9
-    END = 10
+class xmmsv_t(ctypes.Structure):
+    pass
+
+
+def result_callback(f):
+
+    @ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(xmmsv_t), ctypes.c_void_p)
+    def wrapper(v, _):
+        f(Value(v).value)
+        return 1
+
+    _cb.append(wrapper)
+    return wrapper
 
 
 class Client:
 
-    def __init__(self):
-        self._lib = ctypes.CDLL("libxmmsclient.so.6")
-        self._c = self._lib.xmmsc_init(b'xmms2-mpris')
-        sock_name = b'unix:///tmp/xmms-ipc-'+os.getlogin().encode('ascii')
-        if not self._lib.xmmsc_connect(self._c, sock_name):
-            print('failed connecting to daemon')
-            raise SystemExit
-        self._lib.xmmsc_disconnect_callback_set(self._c, on_disconnect)
+    def __init__(self, name="xmms2-mpris2"):
+        super().__init__()
+        self._c = xmmsc.xmmsc_init(name)
 
-    def call(self, func, *args):
-        res = getattr(self._lib, func)(self._c, *args)
-        self._lib.xmmsc_result_wait(res)
-        val = self._lib.xmmsc_result_get_value(res)
-        err_msg = ctypes.c_char_p()
-        err = self._lib.xmmsv_get_error(val, ctypes.byref(err_msg))
-        py_result = self.pyval(val)
-        if err:
-            print('got error in {}: {!r}'.format(func, err_msg.value))
-        self._lib.xmmsc_result_unref(res)
-        return py_result
+    def __del__(self):
+        xmmsc.xmmsc_unref(self._c)
 
-    def pyval(self, value):
-        err_msg = ctypes.c_char_p()
-        if self._lib.xmmsv_get_error(value, ctypes.byref(err_msg)):
-            raise RuntimeError('{!r}'.format(err_msg.value))
-        if self._lib.xmmsv_is_type(value, Types.NONE.value):
-            return None
-        result = ctypes.c_char_p()
-        if self._lib.xmmsv_get_string(value, ctypes.byref(result)):
-            return result.value.decode('utf-8')
-        result = ctypes.c_int64()
-        if self._lib.xmmsv_get_int(value, ctypes.byref(result)):
-            return result.value
-        if self._lib.xmmsv_is_type(value, Types.DICT.value):
-            return self.pydict(value)
-        print("unhandled", Types(self._lib.xmmsv_get_type(value)).name)
-        raise NotImplemented
+    def connect(self, dst=None):
+        if dst is None:
+            dst = '/tmp/xmms-ipc-' + os.getlogin()
+        dst = dst.encode('utf-8')
+        success = xmmsc.xmmsc_connect(self._c, dst)
+        if not success:
+            raise XmmsConnectionError("connection error")
 
-    def pydict(self, value):
+    def io_handle(self):
+        if xmmsc.xmmsc_io_want_out(self._c):
+            xmmsc.xmmsc_io_out_handle(self._c)
+
+        xmmsc.xmmsc_io_in_handle(self._c)
+        return True
+
+    def __getattribute__(self, name):
+        try:
+            return super().__getattribute__(name)
+        except AttributeError:
+            attr_name = "xmmsc_" + name
+            func = getattr(xmmsc, attr_name)
+            LOG.debug(attr_name)
+            return lambda *a: Result(func(self._c, *a))
+
+
+class Result:
+
+    def __init__(self, _res):
+        super().__init__()
+        self._r = _res
+
+    def __del__(self):
+        xmmsc.xmmsc_result_unref(self._r)
+
+    def wait(self):
+        xmmsc.xmmsc_result_wait(self._r)
+        return self
+
+    def notifier_set(self, cb):
+        wrapped = result_callback(cb)
+        _cb.append(wrapped)
+        xmmsc.xmmsc_result_notifier_set(self._r, wrapped, None)
+
+    def get_value(self):
+        return Value(xmmsc.xmmsc_result_get_value(self._r)).value
+
+    def __getattribute__(self, name):
+        try:
+            return super().__getattribute__(name)
+        except AttributeError:
+            attr_name = "xmmsc_result_" + name
+            func = getattr(xmmsc, attr_name)
+            return lambda *a: func(self._r, *a)
+
+
+class XmmsException(Exception):
+    pass
+
+
+class XmmsConnectionError(XmmsException):
+    pass
+
+
+class Value:
+
+    class Type(enum.Enum):
+        NONE = 0
+        ERROR = 1
+        INT32 = 2
+        STRING = 3
+        COLL = 4
+        BIN = 5
+        LIST = 6
+        DICT = 7
+
+    def __init__(self, _val):
+        super().__init__()
+        self._v = _val
+
+    @property
+    def value(self):
+        return self._val(self._v)
+
+    @classmethod
+    def _val(cls, v):
+        type_ = Value.Type(xmmsc.xmmsv_get_type(v))
+        if type_ == cls.Type.NONE:
+            return
+        if type_ == cls.Type.DICT:
+            return cls._pydict(v)
+        if type_ == cls.Type.LIST:
+            return cls._pylist(v)
+
+        handlers = {
+            Value.Type.ERROR: (ctypes.c_char_p, xmmsc.xmmsv_get_error),
+            Value.Type.INT32: (ctypes.c_int32, xmmsc.xmmsv_get_int),
+            Value.Type.STRING: (ctypes.c_char_p, xmmsc.xmmsv_get_string),
+        }
+        res_t, converter = handlers[type_]
+        res = res_t()
+        success = converter(v, ctypes.byref(res))
+        if not success:
+            raise RuntimeError("can't extract value")
+
+        if type_ == Value.Type.ERROR:
+            raise XmmsException(res.value.decode("utf-8"))
+
+        res = res.value
+        if isinstance(res, bytes):
+            return res.decode("utf-8")
+        return res
+
+    @staticmethod
+    def _pylist(value):
+        ret = []
+
+        @ctypes.CFUNCTYPE(None, ctypes.c_voidp, ctypes.c_void_p)
+        def append(v, _):
+            ret.append(Value(v).value)
+
+        xmmsc.xmmsv_list_foreach(value, append, None)
+        return ret
+
+    @staticmethod
+    def _pydict(value):
         ret = collections.OrderedDict()
 
         @ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_voidp,
                           ctypes.c_void_p)
         def append(k, v, _):
-            ret[k.decode('utf-8')] = self.pyval(v)
-        self._lib.xmmsv_dict_foreach(value, append, None)
+            ret[k.decode('utf-8')] = Value(v).value
+
+        xmmsc.xmmsv_dict_foreach(value, append, None)
         return ret
 
-    def quit(self):
-        return self.call('xmmsc_quit')
 
-    def play(self):
-        return self.call('xmmsc_playback_start')
+class MediaPlayer(dbus.service.Object):
 
-    def pause(self):
-        return self.call('xmmsc_playback_pause')
+    def __init__(self):
+        bus_name = dbus.service.BusName(
+            'org.mpris.MediaPlayer2.xmms2', bus=dbus.SessionBus())
+        dbus.service.Object.__init__(self, bus_name, '/org/mpris/MediaPlayer2')
 
-    def status(self):
-        val = self.call('xmmsc_playback_status')
-        return Status(val)
+        self.cli = Client()
+        self.cli.connect()
+        self.cli.broadcast_playback_status().notifier_set(self.on_status)
+        self.cli.broadcast_playback_current_id().notifier_set(
+            self.on_track_change)
+        self.cli.broadcast_playback_volume_changed().notifier_set(
+            self.on_volume_change)
+        self.cli.broadcast_quit().notifier_set(self.on_quit)
 
-    def toggle(self):
-        val = self.status()
-        if val == Status.Playing:
-            self.pause()
-        else:
-            self.play()
+        self._props = {
+            MPRIS_IFACE: dict(
+                CanQuit=True,
+                CanRaise=False,
+                CanSetFullscreen=False,
+                # DesktopEntry (optional)
+                Fullscreen=False,
+                HasTrackList=False,
+                Identity="xmms2",
+                SupportedUriSchemes=["http", "https"],
+                SupportedMimeTypes=[
+                    # TODO list from server
+                    "audio/mpeg",
+                    "application/ogg",
+                ], ),
+            MPRIS_PLAYER_IFACE: dict(
+                PlaybackStatus=self.playback_status,
+                LoopStatus="None",
+                Rate=1.0,
+                Shuffle=False,
+                Metadata=self.metadata(),
+                Volume=self.volume,
+                Position=0,
+                MinimumRate=1.0,
+                MaximumRate=1.0,
+                CanGoNext=self.can_go_next,
+                CanGoPrevious=self.can_go_previous,
+                CanPlay=self.has_track,
+                CanPause=self.has_track,
+                CanSeek=True,
+                CanControl=True, ),
+        }
 
-    def stop(self):
-        return self.call('xmmsc_playback_stop')
+    def on_status(self, v):
+        name = Status(v).name
+        LOG.debug("got status %s", name)
+        self.Set(MPRIS_PLAYER_IFACE, "PlaybackStatus", name)
 
-    def next(self):
-        self.call('xmmsc_playlist_set_next_rel', 1)
-        self.call('xmmsc_playback_tickle', 1)
+    def on_quit(self, v):
+        LOG.critical("got quit signal")
+        loop.quit()
+        raise KeyboardInterrupt
 
-    def previous(self):
-        self.call('xmmsc_playlist_set_next_rel', -1)
-        self.call('xmmsc_playback_tickle', 1)
+    def on_track_change(self, v):
+        LOG.info("got track change to %d", v)
+        self.Set(MPRIS_PLAYER_IFACE, "Metadata", self.metadata(v))
+        self.Set(MPRIS_PLAYER_IFACE, "CanGoNext", self.can_go_next)
+        self.Set(MPRIS_PLAYER_IFACE, "CanGoPrevious", self.can_go_previous)
 
-    def shuffle(self):
-        self.call('xmmsc_playlist_shuffle', None)
+    def on_volume_change(self, v):
+        vol = dbus.Double(v.get('master', 0) / 100.0)
+        LOG.info("volume change to %f", vol)
+        self._props[MPRIS_PLAYER_IFACE]["Volume"] = vol
+        self.PropertiesChanged(MPRIS_PLAYER_IFACE, {"Volume": vol}, [])
 
-    def current_track(self):
-        current = self.call('xmmsc_playback_current_id')
-        return self.call('xmmsc_medialib_get_info', current)
-
-    def volume(self, value=None):
-        if value is not None:
-            res = self.call('xmmsc_playback_volume_set', value*100)
-        else:
-            res = self.call('xmmsc_playback_volume_get')
-        return res.get('master', 100)/100
-
-    def get_pls_pos(self):
-        pls = self.call('xmmsc_playlist_current_active').encode("utf-8")
-        pos = self.call('xmmsc_playlist_current_pos', ctypes.c_char_p(pls))
-        return pos['position']
-
-    def playtime(self):
-        return self.call('xmmsc_playback_playtime')*1000
-
-
-def props(interface_name):
-    def wrapper(f):
-        _props.setdefault(interface_name, {})[f.__name__] = f
-        return f
-    return wrapper
-
-
-class Player:
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='', out_signature='')
-    def Next(self):
-        self.client.next()
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='', out_signature='')
-    def Previous(self):
-        self.client.previous()
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='', out_signature='')
-    def Pause(self):
-        self.client.pause()
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='', out_signature='')
-    def Play(self):
-        self.client.play()
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='', out_signature='')
-    def PlayPause(self):
-        self.client.toggle()
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='', out_signature='')
-    def Stop(self):
-        self.client.stop()
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='x', out_signature='')
-    def Seek(self, offset):
-        pass
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='ox', out_signature='')
-    def SetPosition(self, track_id, position):
-        pass
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=MPRIS_PLAYER_IFACE,
-                         in_signature='s', out_signature='')
-    def OpenUri(self, uri):
-        pass
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @props(MPRIS_PLAYER_IFACE)
-    def PlaybackStatus(self):
-        return self.client.status().name
-
-    @props(MPRIS_PLAYER_IFACE)
-    def LoopStatus(self, value=None):
-        return "None"  # None, Track, Playlist
-
-    @props(MPRIS_PLAYER_IFACE)
-    def Rate(self, value=None):
-        return 1.0
-
-    @props(MPRIS_PLAYER_IFACE)
-    def Shuffle(self, value=None):
-        if value:
-            self.client.shuffle()
+    @property
+    def has_track(self):
         return False
 
-    @props(MPRIS_PLAYER_IFACE)
-    def Metadata(self):
+    @property
+    def playback_status(self):
+        value = self.cli.playback_status().wait().get_value()
+        return Status(value).name
+
+    @property
+    def current_pos(self):
+        playlist = self.cli.playlist_current_active().wait().get_value()
+        playlist = playlist.encode('utf-8')
+        res = self.cli.playlist_current_pos(playlist).wait().get_value()
+        return res['position']
+
+    @property
+    def can_go_previous(self):
+        return self.current_pos > 0
+
+    @property
+    def can_go_next(self):
+        playlist = self.cli.playlist_current_active().wait().get_value()
+        playlist = playlist.encode('utf-8')
+        entries = self.cli.playlist_list_entries(playlist).wait().get_value()
+        return self.current_pos < len(entries) - 1
+
+    @property
+    def volume(self):
+        LOG.debug("getting volume")
         try:
-            info = self.client.current_track()
-        except RuntimeError:
+            volumes = self.cli.playback_volume_get().wait().get_value()
+        except XmmsException:
+            return dbus.types.Double(0)
+        return dbus.types.Double(volumes.get("master", 0) / 100.0)
+
+    @volume.setter
+    def volume(self, value):
+        new_val = value * 100
+        LOG.info("Setting volume to %f", value)
+        c_val = ctypes.c_int32(int(new_val))
+        self.cli.playback_volume_set("master", c_val).wait()
+
+    def metadata(self, current_id=None):
+        if not current_id:
+            current_id = self.cli.playback_current_id().wait().get_value()
+        try:
+            info = self.cli.medialib_get_info(current_id).wait().get_value()
+        except XmmsException:
             return dbus.Dictionary(signature="sv")
 
-        ret = dbus.Dictionary({
-            "mpris:trackid": int(info['id']['server']),
-            "xesam:title": ' - '.join(info.get('title', {}).values()),
-            "xesam:album": ' - '.join(info.get('album', {}).values()),
-            "xesam:useCount": info['timesplayed']['server'],
-            "xesam:genre": dbus.Array(info.get('genre', {}).values(),
-                                      signature="s"),
-        }, signature="sv")
+        ret = dbus.Dictionary(
+            {
+                "mpris:trackid": int(info['id']['server']),
+                "xesam:title": ' - '.join(info.get('title', {}).values()),
+                "xesam:album": ' - '.join(info.get('album', {}).values()),
+                "xesam:useCount": info['timesplayed']['server'],
+                "xesam:genre": dbus.Array(
+                    info.get('genre', {}).values(), signature="s"),
+                # "xesam:url": info.get("url", {}).get("server", ""),
+            },
+            signature="sv")
         if 'duration' in info:
             ret['mpris:length'] = dbus.Int64(
-                next(iter((info['duration'].values())))*1000)
+                next(iter((info['duration'].values()))) * 1000)
+        if not ret.get('xesam:album', None):
+            ret['xesam:album'] = ' - '.join(info.get('channel', {}).values())
         return ret
 
-    @props(MPRIS_PLAYER_IFACE)
-    def Volume(self, value=None):
-        try:
-            return self.client.volume(value)
-        except:
-            return 0
+    @dbus.service.method(
+        dbus_interface=MPRIS_IFACE, in_signature='', out_signature='')
+    def Quit(self):
+        self.cli.quit().wait()
 
-    @props(MPRIS_PLAYER_IFACE)
-    def Position(self):
-        return self.client.playtime()
-
-    @props(MPRIS_PLAYER_IFACE)
-    def MinimumRate(self):
-        return 1.0
-
-    @props(MPRIS_PLAYER_IFACE)
-    def MaximumRate(self):
-        return 1.0
-
-    @props(MPRIS_PLAYER_IFACE)
-    def CanGoNext(self):
-        # FIXME hastrack?
-        return True
-
-    @props(MPRIS_PLAYER_IFACE)
-    def CanGoPrevious(self):
-        val = self.client.get_pls_pos()
-        return val > 0
-
-    @props(MPRIS_PLAYER_IFACE)
-    def CanPlay(self):
-        # FIXME hastrack?
-        return True
-
-    @props(MPRIS_PLAYER_IFACE)
-    def CanPause(self):
-        # FIXME hastrack?
-        return True
-
-    @props(MPRIS_PLAYER_IFACE)
-    def CanSeek(self):
-        return True
-
-    @props(MPRIS_PLAYER_IFACE)
-    def CanControl(self):
-        return True
-
-
-class MediaPlayer2:
-
-    @dbus.service.method(dbus_interface=MPRIS_IFACE,
-                         in_signature='', out_signature='')
+    @dbus.service.method(
+        dbus_interface=MPRIS_IFACE, in_signature='', out_signature='')
     def Raise(self):
         pass
 
-    @dbus.service.method(dbus_interface=MPRIS_IFACE,
-                         in_signature='', out_signature='')
-    def Quit(self):
-        self.client.quit()
-        # loop.quit()
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    def Next(self):
+        self.cli.playlist_set_next_rel(1).wait()
+        self.cli.playback_tickle(1).wait()
 
-    @props(MPRIS_IFACE)
-    def CanQuit(self):
-        return True
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    def Previous(self):
+        self.cli.playlist_set_next_rel(-1).wait()
+        self.cli.playback_tickle(1).wait()
 
-    @props(MPRIS_IFACE)
-    def Fullscreen(self, values=None):
-        return False
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    def Pause(self):
+        self.cli.playback_pause().wait()
 
-    @props(MPRIS_IFACE)
-    def CanSetFullscreen(self):
-        return False
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    def PlayPause(self):
+        if self._props[MPRIS_PLAYER_IFACE]['PlaybackStatus'] == 'Playing':
+            self.Pause()
+        else:
+            self.Play()
 
-    @props(MPRIS_IFACE)
-    def CanRaise(self):
-        return False
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    def Stop(self):
+        self.cli.playback_stop().wait()
 
-    @props(MPRIS_IFACE)
-    def HasTrackList(self):
-        return False
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='', out_signature='')
+    def Play(self):
+        self.cli.playback_start().wait()
 
-    @props(MPRIS_IFACE)
-    def Identify(self):
-        return "xmms2"
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='x', out_signature='')
+    def Seek(self, offset):
+        LOG.info("seek to %d", offset)
+        # emit Seeked signal
+        pass
 
-    @props(MPRIS_IFACE)
-    def SupportedUriSchemes(self):
-        return ["http", "https"]
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='ox', out_signature='')
+    def SetPosition(self, track_id, position):
+        LOG.info("set pos to %d", position)
+        # emit Seeked signal
+        pass
 
-    @props(MPRIS_IFACE)
-    def SupportedMimeTypes(self):
-        return [
-            "audio/mpeg",
-            "application/ogg"]
+    @dbus.service.method(
+        dbus_interface=MPRIS_PLAYER_IFACE, in_signature='s', out_signature='')
+    def OpenUri(self, uri):
+        LOG.info("open uri to %s", uri)
+        pass
 
-
-class MediaPlayer(dbus.service.Object, MediaPlayer2, Player):
-
-    def __init__(self):
-        self.client = Client()
-        bus_name = dbus.service.BusName('org.mpris.MediaPlayer2.xmms2',
-                                        bus=dbus.SessionBus())
-        MediaPlayer2.__init__(self)
-        Player.__init__(self)
-        dbus.service.Object.__init__(self, bus_name, '/org/mpris/MediaPlayer2')
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_IFACE), [])
-        self.PropertiesChanged(MPRIS_PLAYER_IFACE,
-                               self.GetAll(MPRIS_PLAYER_IFACE), [])
-
-    @dbus.service.method(dbus_interface=dbus.PROPERTIES_IFACE,
-                         in_signature='ss', out_signature='v')
+    @dbus.service.method(
+        dbus_interface=dbus.PROPERTIES_IFACE,
+        in_signature='ss',
+        out_signature='v')
     def Get(self, interface_name, property_name):
+        return self.GetAll(interface_name)[property_name]
+
+    @dbus.service.method(
+        dbus_interface=dbus.PROPERTIES_IFACE,
+        in_signature='s',
+        out_signature='a{sv}')
+    def GetAll(self, interface_name):
         try:
-            return _props.get(interface_name)[property_name]()
+            return self._props[interface_name]
         except KeyError:
             raise dbus.exceptions.DBusException(
                 'com.example.UnknownInterface',
                 'The MediaPlayer object does not implement the {} interface'
                 .format(interface_name))
 
-    @dbus.service.method(dbus_interface=dbus.PROPERTIES_IFACE,
-                         in_signature='s', out_signature='a{sv}')
-    def GetAll(self, interface_name):
-        retval = _props.get(interface_name, None)
-        if retval:
-            return {k: v(self) for k, v in retval.items()}
-
-        raise dbus.exceptions.DBusException(
-            'com.example.UnknownInterface',
-            'The MediaPlayer object does not implement the {} interface'
-            .format(interface_name))
-
-    @dbus.service.method(dbus_interface=dbus.PROPERTIES_IFACE,
-                         in_signature='ssv')
+    @dbus.service.method(
+        dbus_interface=dbus.PROPERTIES_IFACE, in_signature='ssv')
     def Set(self, interface_name, property_name, new_value):
-        # validate the property name and value, update internal state…
-        self.PropertiesChanged(interface_name,
-                               {property_name: new_value}, [])
+        LOG.debug("Set %s to %r", property_name, new_value)
+        if property_name == "Volume":
+            self.volume = new_value
+        self._props[interface_name][property_name] = new_value
+        self.PropertiesChanged(interface_name, {property_name: new_value}, [])
 
-    @dbus.service.signal(dbus_interface=dbus.PROPERTIES_IFACE,
-                         signature='sa{sv}as')
+    @dbus.service.signal(
+        dbus_interface=dbus.PROPERTIES_IFACE, signature='sa{sv}as')
     def PropertiesChanged(self, interface_name, changed_properties,
                           invalidated_properties):
         pass
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=LOG_LEVEL,
+        format="%(asctime)-15s %(levelname)s [%(process)s] %(message)s",
+        # filename="/tmp/xmms-mpris-{}".format(os.getlogin()),
+    )
     DBusGMainLoop(set_as_default=True)
-    player = MediaPlayer()
+    m = MediaPlayer()
     try:
+        # thread = threading.Thread(target=m.cli.io_handle).start()
         loop = GLib.MainLoop()
+        GLib.timeout_add(200, m.cli.io_handle)
+        LOG.info("Starting glib mainloop")
         loop.run()
     except KeyboardInterrupt:
+        LOG.exception("KeyboardInterrupt. quitting.")
+        loop.quit()
+    except:
+        LOG.exception("global failure")
         loop.quit()

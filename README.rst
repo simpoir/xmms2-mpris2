@@ -19,20 +19,21 @@ Installation
   xmms2 server shutdown
   xmms2 list
 
-You probably also want to install libxmmsclient (the c lib, not the python)
-because it's using that. (worked out of the box with python3)
+You probably also want to install libxmmsclient (the c lib, not the python lib)
+because it's using that. (the py lib is not packaged for python3)
 
 
 Bug
 ===
 
-Yes and I don't really care.
+Yes, and I don't really care.
 
 
 Roadmap
 =======
 
-None.
+I plan to do exactly nothing more about this code. Hopefully, I'll stick to
+that plan.
 
 
 Contributing
@@ -41,14 +42,13 @@ Contributing
 I'd rather prefer you spend your effort on something else. I won't maintain.
 I may or may not look in my inbox once in a while for pull requests.
 Notice how there are no tests and no documentation or comments…
+That was intentional.
 
 
 References
 ==========
 
 If you sumbled here for another reason, here are some references.
-Note that the properties implementation is not great (slow), so if that's what
-you were looking for, I suggest you look at it and learn how not to do it.
 
 - https://doxygen.xmms2.org/clientlib/DrJekyll/xmmsclient/modules.html
 - https://dbus.freedesktop.org/doc/dbus-python/doc/tutorial.html
